@@ -1,0 +1,11 @@
+google-adk
+google-cloud-bigquery
+google-cloud-aiplatform
+google-generativeai
+sentence-transformers
+faiss-cpu
+google-api-python-client
+pandas 
+numpy 
+requests 
+python-dotenv
