@@ -1,4 +1,4 @@
-# techvision_agent/agent.py (Complete Production System from Updated Notebook)
+# techvision_agent/agent.py (Complete Production System with PDF Processing)
 import os
 import json
 import pandas as pd
@@ -8,13 +8,17 @@ import random
 from typing import Dict, List, Any, Optional
 import logging
 import time
+import io
+
+# PDF processing import
+import PyPDF2
 
 # ADK imports
 from google.adk.agents import LlmAgent
 from google.adk.tools.function_tool import FunctionTool
 
 # Production imports (no sentence-transformers or faiss)
-from google.cloud import bigquery, aiplatform
+from google.cloud import bigquery, aiplatform, storage
 import google.generativeai as genai
 from googleapiclient.discovery import build
 import requests
@@ -30,6 +34,10 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 GOOGLE_SEARCH_KEY = os.getenv("GOOGLE_SEARCH_KEY")
 GOOGLE_SEARCH_ENGINE_ID = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
+
+# Cloud Storage configuration for PDF documents
+STORAGE_BUCKET_NAME = os.getenv("STORAGE_BUCKET_NAME", "chat_drl_bq_data")
+PDF_FOLDER_PATH = os.getenv("PDF_FOLDER_PATH", "unstructured_documents/")
 
 # Initialize services
 try:
@@ -47,8 +55,8 @@ except Exception as e:
     logger.error(f"BigQuery initialization failed: {str(e)}")
     bq_client = None
 
-class ProductionDataGenerator:
-    """Production-ready data generator and BigQuery manager (from notebook)"""
+class ProductionDataManager:
+    """Production data manager that works with existing BigQuery tables"""
 
     def __init__(self, project_id: str):
         self.project_id = project_id
@@ -56,8 +64,11 @@ class ProductionDataGenerator:
         self.client = bq_client
 
     def get_table_schemas(self) -> Dict[str, Any]:
-        """Get schemas for all tables"""
+        """Get schemas for all existing tables"""
         try:
+            if not self.client:
+                return {}
+                
             dataset_ref = self.client.get_dataset(f"{self.project_id}.{self.dataset_id}")
             schemas = {}
 
@@ -80,20 +91,131 @@ class ProductionDataGenerator:
             logger.error(f"Schema retrieval failed: {str(e)}")
             return {}
 
+    def validate_tables_exist(self) -> bool:
+        """Validate that required tables exist"""
+        try:
+            if not self.client:
+                return False
+                
+            required_tables = ["sales_data", "customer_metrics", "employee_data", "financial_reports"]
+            dataset_ref = self.client.get_dataset(f"{self.project_id}.{self.dataset_id}")
+            existing_tables = [table.table_id for table in self.client.list_tables(dataset_ref)]
+
+            missing_tables = [table for table in required_tables if table not in existing_tables]
+
+            if missing_tables:
+                logger.warning(f"Missing tables: {missing_tables}")
+                return False
+
+            logger.info("✅ All required tables exist")
+            return True
+        except Exception as e:
+            logger.error(f"Table validation failed: {str(e)}")
+            return False
+
+class PDFDocumentProcessor:
+    """PDF document processor that reads from Cloud Storage and extracts text"""
+
+    def __init__(self, project_id: str, bucket_name: str):
+        self.project_id = project_id
+        self.bucket_name = bucket_name
+
+        # Initialize Cloud Storage client
+        try:
+            self.storage_client = storage.Client(project=project_id)
+            self.bucket = self.storage_client.bucket(bucket_name)
+            logger.info("✅ Cloud Storage client initialized successfully")
+        except Exception as e:
+            logger.error(f"Cloud Storage initialization failed: {str(e)}")
+            self.storage_client = None
+            self.bucket = None
+
+    def extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
+        """Extract text from PDF bytes using PyPDF2"""
+        try:
+            pdf_file = io.BytesIO(pdf_bytes)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+
+            text = ""
+            for page_num, page in enumerate(pdf_reader.pages):
+                try:
+                    page_text = page.extract_text()
+                    text += page_text + "\n"
+                except Exception as e:
+                    logger.warning(f"Could not extract text from page {page_num + 1}: {str(e)}")
+                    continue
+
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"PDF text extraction failed: {str(e)}")
+
+    def list_pdf_documents(self, folder_path: str = "") -> List[Dict[str, str]]:
+        """List all PDF documents in the specified folder"""
+        try:
+            if not self.bucket:
+                return []
+                
+            blobs = self.bucket.list_blobs(prefix=folder_path)
+            pdf_documents = []
+
+            for blob in blobs:
+                if blob.name.lower().endswith('.pdf'):
+                    # Extract title from filename (remove path and extension)
+                    filename = blob.name.split('/')[-1]
+                    title = filename[:-4]  # Remove .pdf extension
+
+                    pdf_documents.append({
+                        "blob_name": blob.name,
+                        "title": title,
+                        "size": blob.size,
+                        "created": blob.time_created.isoformat() if blob.time_created else None,
+                        "updated": blob.updated.isoformat() if blob.updated else None
+                    })
+
+            logger.info(f"Found {len(pdf_documents)} PDF documents in bucket")
+            return pdf_documents
+        except Exception as e:
+            logger.error(f"Failed to list PDF documents: {str(e)}")
+            return []
+
+    def download_and_extract_text(self, blob_name: str) -> Dict[str, str]:
+        """Download PDF from Cloud Storage and extract text"""
+        try:
+            if not self.bucket:
+                raise Exception("Cloud Storage bucket not initialized")
+                
+            blob = self.bucket.blob(blob_name)
+            pdf_bytes = blob.download_as_bytes()
+
+            text = self.extract_text_from_pdf(pdf_bytes)
+
+            # Extract title from blob name
+            filename = blob_name.split('/')[-1]
+            title = filename[:-4]  # Remove .pdf extension
+
+            return {
+                "title": title,
+                "content": text,
+                "blob_name": blob_name,
+                "word_count": len(text.split())
+            }
+        except Exception as e:
+            raise Exception(f"Failed to download and process PDF {blob_name}: {str(e)}")
+
 class GeminiEmbeddingsBigQueryCorpus:
-    """Production document corpus using Gemini embeddings and BigQuery vector search (from notebook)"""
+    """Production document corpus using Gemini embeddings and BigQuery vector search with PDF integration"""
 
     def __init__(self, project_id: str, dataset_id: str = "techvision_analytics"):
-        logger.info("📚 Initializing Gemini + BigQuery document corpus...")
+        logger.info("📚 Initializing Gemini + BigQuery document corpus with PDF processing...")
 
         self.project_id = project_id
         self.dataset_id = dataset_id
-        self.table_id = "document_embeddings"
+        self.table_id = "document_embeddings_new"
         self.full_table_id = f"{project_id}.{dataset_id}.{self.table_id}"
         self.client = bq_client
         self.document_count = 0
 
-        # Production documents from notebook
+        # Production documents from original system (fallback)
         self.production_documents = {
             "Strategic Plan 2024-2025": """
 TechVision Analytics Strategic Plan 2024-2025
@@ -110,25 +232,6 @@ Key Strategic Objectives:
 
 Market Positioning:
 We position ourselves as the bridge between enterprise-grade analytics tools (too complex/expensive) and basic reporting tools (insufficient capabilities). Our sweet spot is companies with 100-5000 employees who need sophisticated insights without enterprise complexity.
-
-Competitive Advantages:
-- Industry-specific analytics templates
-- No-code/low-code interface for business users
-- Real-time data processing capabilities
-- Dedicated customer success management
-- Transparent, usage-based pricing model
-
-2024 Priorities:
-Q1: Complete Series A funding ($15M target)
-Q2: Launch predictive analytics module
-Q3: European market entry (UK, Germany)
-Q4: Advanced reporting and dashboard capabilities
-
-Investment Areas:
-- R&D: 40% of budget allocated to product development
-- Sales & Marketing: 35% focused on growth acceleration
-- Customer Success: 15% ensuring retention and expansion
-- Operations: 10% maintaining infrastructure and compliance
 
 Success Metrics:
 - Monthly Recurring Revenue (MRR) growth >15% month-over-month
@@ -162,182 +265,19 @@ Growth Phase (Days 31-180):
 - Usage analytics review and optimization suggestions
 - Identification of expansion opportunities
 
-Maturity Phase (180+ Days):
-- Quarterly strategic business reviews
-- Advanced feature rollouts and training
-- Best practice sharing and peer networking
-- Advocacy program participation
-- Renewal discussions and contract optimization
-- Strategic partnership development opportunities
-
 Customer Health Scoring:
 Red (At Risk): <60% feature utilization, no recent logins, support tickets unresolved
 Yellow (Needs Attention): 60-80% utilization, infrequent usage, basic feature adoption
 Green (Healthy): >80% utilization, regular engagement, expanding use cases
 Blue (Champion): >95% utilization, active advocate, referring new customers
-
-Intervention Strategies:
-At-Risk Customers:
-- Immediate executive outreach within 24 hours
-- Root cause analysis of adoption barriers
-- Customized success plan with clear milestones
-- Additional training and technical support
-- Executive sponsor engagement if necessary
-
-Communication Protocols:
-- Weekly internal customer health reviews
-- Monthly customer communication (at minimum)
-- Quarterly business reviews with decision makers
-- Immediate escalation for any red health scores
-- Regular feedback collection and product team collaboration
 """,
-
-            "Product Feature Specifications": """
-TechVision Analytics Product Feature Specifications
-
-Core Platform Architecture:
-
-Data Ingestion Layer:
-- Real-time data streaming via Apache Kafka
-- Batch processing using Apache Spark
-- 200+ pre-built connectors for common business systems
-- Custom API integration capabilities
-- Data validation and quality monitoring
-- Automatic schema detection and evolution
-
-Analytics Engine:
-- In-memory processing for sub-second query responses
-- Machine learning pipeline with automated model training
-- Statistical analysis library with 100+ built-in functions
-- Time-series forecasting and trend analysis
-- Anomaly detection with customizable sensitivity
-- Natural language query interface (beta)
-
-Visualization Layer:
-- Drag-and-drop dashboard builder with 50+ chart types
-- Interactive filtering and drill-down capabilities
-- Mobile-responsive design for all devices
-- White-label customization options
-- Scheduled report generation and distribution
-- Collaborative annotation and sharing tools
-
-Predictive Analytics Suite (Launched Q2 2024):
-- Revenue forecasting with 95% accuracy rate
-- Customer churn prediction with early warning system
-- Demand planning and inventory optimization
-- Market trend analysis and competitive benchmarking
-- Automated insight generation with natural language explanations
-
-Advanced Security Framework:
-- Enterprise-grade encryption (AES-256) for data at rest and in transit
-- Role-based access control with granular permissions
-- Single Sign-On (SSO) integration with major identity providers
-- Audit trails with complete user activity logging
-- GDPR and SOC 2 Type II compliance
-
-Performance Specifications:
-- Query response time: <200ms for standard reports
-- Dashboard load time: <3 seconds for complex visualizations
-- System uptime: 99.9% SLA with 24/7 monitoring
-- Concurrent users: 10,000+ supported per instance
-""",
-
-            "Q4 Financial Analysis Report": """
-TechVision Analytics Q4 2024 Financial Analysis Report
-
-Executive Summary:
-Q4 2024 represents our strongest quarter to date, with record revenue growth, improved operational efficiency, and successful market expansion. Key highlights include 180% year-over-year revenue growth and achievement of positive cash flow for the first time.
-
-Revenue Performance:
-- Total Revenue: $4.2M (vs $1.8M Q4 2023, +133% YoY)
-- Monthly Recurring Revenue (MRR): $1.3M (vs $580K Q4 2023, +124% YoY)
-- Average Contract Value (ACV): $48,000 (vs $32,000 Q4 2023, +50% YoY)
-- New Customer Acquisition: 47 new logos in Q4
-- Customer Expansion Revenue: $420K (10% of total revenue)
-- Revenue Retention Rate: 118% (including expansion)
-
-Geographic Revenue Distribution:
-- North America: $2.8M (67% of total)
-- Europe: $1.1M (26% of total) - First full quarter post-expansion
-- APAC: $300K (7% of total) - Pilot program launched
-
-Customer Metrics:
-- Total Active Customers: 312 (vs 189 Q4 2023, +65% YoY)
-- Customer Churn Rate: 3.2% (improved from 8.1% Q4 2023)
-- Net Promoter Score: 67 (industry benchmark: 31)
-- Customer Satisfaction: 4.7/5.0 (based on quarterly surveys)
-- Average Time to First Value: 12 days (improved from 28 days)
-
-Operating Expenses:
-- Total Operating Expenses: $3.1M (vs $2.2M Q4 2023, +41% YoY)
-- Sales & Marketing: $1.4M (45% of expenses, 33% of revenue)
-- Research & Development: $980K (32% of expenses, 23% of revenue)
-- Customer Success: $465K (15% of expenses, 11% of revenue)
-
-Key Efficiency Metrics:
-- Customer Acquisition Cost (CAC): $3,200 (improved from $4,800 Q4 2023)
-- CAC Payback Period: 8.2 months (improved from 14.1 months)
-- Lifetime Value to CAC Ratio: 4.8:1 (healthy SaaS benchmark: 3:1+)
-- Gross Margin: 87% (consistent with Q3 2024)
-- Operating Margin: 26% (first positive quarter)
-
-Cash Flow Analysis:
-- Operating Cash Flow: $890K positive (vs -$650K Q4 2023)
-- Free Cash Flow: $720K positive (first positive FCF quarter)
-- Monthly Burn Rate: $285K (reduced from $420K in Q3)
-""",
-
-            "Market Research: Analytics Industry": """
-Analytics Industry Market Research Report 2024
-
-Industry Overview:
-The business analytics software market continues robust expansion, driven by digital transformation initiatives and increasing data volumes. The global market size reached $274 billion in 2024, with projected growth to $415 billion by 2028 (CAGR: 11.2%).
-
-Market Segmentation:
-- Business Intelligence Platforms: 45% market share ($123B)
-- Advanced Analytics: 28% market share ($77B)
-- Data Visualization Tools: 15% market share ($41B)
-- Self-Service Analytics: 12% market share ($33B)
-
-Organization Size Breakdown:
-- Large Enterprises (5000+ employees): 62% of revenue
-- Mid-Market (500-5000 employees): 28% of revenue
-- Small Business (<500 employees): 10% of revenue
-
-Competitive Landscape:
-1. Microsoft (Power BI): 18.2% market share, strong growth in SMB segment
-2. Tableau (Salesforce): 14.7% market share, premium visualization focus
-3. SAS: 12.3% market share, advanced analytics and enterprise AI
-4. IBM (Cognos): 9.8% market share, enterprise reporting emphasis
-5. Qlik: 8.1% market share, associative analytics model
-6. Oracle: 6.9% market share, integrated cloud applications
-
-Key Market Trends:
-- Augmented Analytics: 78% of new deployments include AI/ML capabilities
-- Real-Time Processing: 65% demand for sub-second query response
-- Cloud-First Architecture: 71% of new implementations are cloud-based
-- Natural Language Interfaces: 43% adoption rate for conversational analytics
-- Embedded Analytics: 55% growth in white-label and API-first solutions
-
-Customer Decision Criteria:
-1. Ease of Use: 92% cite as critical factor
-2. Total Cost of Ownership: 87% primary consideration
-3. Scalability and Performance: 84% essential requirement
-4. Integration Capabilities: 81% must-have feature
-
-Mid-Market Opportunities:
-- Digital transformation acceleration post-pandemic
-- Increasing data literacy among business users
-- Demand for industry-specific analytics solutions
-- Growth in remote and hybrid work environments
-"""
         }
 
         # Create embeddings table if it doesn't exist
         self._create_embeddings_table()
 
     def _create_embeddings_table(self):
-        """Create BigQuery table for storing document embeddings"""
+        """Create BigQuery table for storing document embeddings with PDF support"""
         if not self.client:
             logger.error("BigQuery client not available")
             return
@@ -351,6 +291,7 @@ Mid-Market Opportunities:
                 bigquery.SchemaField("word_count", "INTEGER", mode="REQUIRED"),
                 bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
                 bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
+                bigquery.SchemaField("source_blob", "STRING", mode="NULLABLE"),  # New field for PDF source
             ]
 
             table = bigquery.Table(self.full_table_id, schema=schema)
@@ -364,7 +305,7 @@ Mid-Market Opportunities:
         """Generate embedding using Gemini embedding model"""
         try:
             result = genai.embed_content(
-                model="models/text-embedding-004",
+                model="models/gemini-embedding-001",
                 content=text,
                 task_type="RETRIEVAL_DOCUMENT"
             )
@@ -373,8 +314,86 @@ Mid-Market Opportunities:
             logger.error(f"Failed to generate embedding: {str(e)}")
             raise
 
+    def add_pdf_document(self, pdf_data: Dict[str, str]):
+        """Add PDF document to BigQuery with Gemini embeddings"""
+        try:
+            if not self.client:
+                raise Exception("BigQuery client not available")
+
+            # Generate unique doc ID
+            doc_id = f"PDF_{self.document_count:03d}"
+            self.document_count += 1
+
+            # Generate embedding using Gemini
+            logger.info(f"🧠 Generating Gemini embedding for: {pdf_data['title'][:50]}...")
+            embedding = self._generate_embedding(pdf_data['content'])
+
+            # Prepare row data with proper datetime formatting
+            row_data = {
+                "doc_id": doc_id,
+                "title": pdf_data['title'],
+                "content": pdf_data['content'],
+                "doc_type": "pdf",
+                "word_count": pdf_data['word_count'],
+                "created_at": datetime.now().isoformat(),
+                "embedding": embedding,
+                "source_blob": pdf_data.get('blob_name', '')
+            }
+
+            # Insert into BigQuery
+            errors = self.client.insert_rows_json(
+                self.client.get_table(self.full_table_id),
+                [row_data]
+            )
+
+            if errors:
+                raise Exception(f"BigQuery insertion errors: {errors}")
+
+            logger.info(f"✅ Added PDF document: {pdf_data['title']} (ID: {doc_id}, {len(embedding)} dimensions)")
+
+        except Exception as e:
+            raise Exception(f"Failed to add PDF document: {str(e)}")
+
+    def process_all_pdfs(self, folder_path: str = PDF_FOLDER_PATH):
+        """Process all PDFs from Cloud Storage and add to corpus"""
+        try:
+            # Initialize PDF processor
+            pdf_processor = PDFDocumentProcessor(PROJECT_ID, STORAGE_BUCKET_NAME)
+            
+            # Get list of PDF documents
+            pdf_documents = pdf_processor.list_pdf_documents(folder_path)
+
+            if not pdf_documents:
+                logger.warning("No PDF documents found in the specified folder")
+                return "⚠️ No PDF documents found"
+
+            logger.info(f"📄 Processing {len(pdf_documents)} PDF documents...")
+
+            processed_count = 0
+            for i, pdf_info in enumerate(pdf_documents):
+                try:
+                    logger.info(f"📖 Processing PDF {i+1}/{len(pdf_documents)}: {pdf_info['title']}")
+
+                    # Download and extract text
+                    pdf_data = pdf_processor.download_and_extract_text(pdf_info['blob_name'])
+
+                    # Add to corpus with embeddings
+                    self.add_pdf_document(pdf_data)
+                    processed_count += 1
+
+                except Exception as e:
+                    logger.error(f"Failed to process {pdf_info['title']}: {str(e)}")
+                    continue
+
+            return f"✅ Successfully processed {processed_count}/{len(pdf_documents)} PDF documents"
+
+        except Exception as e:
+            error_msg = f"Failed to process PDFs: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+
     def setup_document_embeddings(self) -> str:
-        """One-time setup: Generate and store all document embeddings"""
+        """One-time setup: Generate and store all document embeddings including PDFs"""
         try:
             if not self.client:
                 return "❌ BigQuery client not available"
@@ -388,12 +407,15 @@ Mid-Market Opportunities:
                 existing_count = result[0].total if result else 0
                 
                 if existing_count > 0:
-                    return f"✅ Document embeddings already exist: {existing_count} documents in BigQuery"
+                    # Also process PDFs if they exist
+                    pdf_result = self.process_all_pdfs()
+                    return f"✅ Document embeddings already exist: {existing_count} documents. {pdf_result}"
             except:
                 pass  # Table might not exist yet
 
             processed_docs = []
             
+            # Process built-in documents
             for doc_id, (title, content) in enumerate(self.production_documents.items()):
                 try:
                     logger.info(f"🧠 Generating Gemini embedding for: {title}")
@@ -408,14 +430,17 @@ Mid-Market Opportunities:
                         "doc_type": "internal",
                         "word_count": len(content.split()),
                         "created_at": datetime.now(),
-                        "embedding": embedding
+                        "embedding": embedding,
+                        "source_blob": None
                     })
                     
                     logger.info(f"✅ Generated embedding for: {title} ({len(embedding)} dimensions)")
                     
                 except Exception as e:
-                    logger.error(f"❌ Failed to generate embedding for {title}: {str(e)}")
+                    logger.error(f"Failed to generate embedding for {title}: {str(e)}")
                     continue
+            
+            response_messages = []
             
             if processed_docs:
                 # Insert into BigQuery
@@ -426,12 +451,16 @@ Mid-Market Opportunities:
                 
                 if errors:
                     logger.error(f"BigQuery insertion errors: {errors}")
-                    return f"❌ Failed to store embeddings: {errors}"
-                
-                logger.info(f"✅ Stored {len(processed_docs)} document embeddings in BigQuery")
-                return f"✅ Successfully stored {len(processed_docs)} documents with Gemini embeddings in BigQuery"
-            else:
-                return "❌ No embeddings were generated successfully"
+                    response_messages.append(f"❌ Failed to store embeddings: {errors}")
+                else:
+                    logger.info(f"✅ Stored {len(processed_docs)} document embeddings in BigQuery")
+                    response_messages.append(f"✅ Successfully stored {len(processed_docs)} documents with Gemini embeddings")
+            
+            # Also process PDFs
+            pdf_result = self.process_all_pdfs()
+            response_messages.append(pdf_result)
+            
+            return " | ".join(response_messages) if response_messages else "❌ No embeddings were generated successfully"
                 
         except Exception as e:
             error_msg = f"Embeddings setup failed: {str(e)}"
@@ -439,44 +468,93 @@ Mid-Market Opportunities:
             return error_msg
 
     def semantic_search(self, query: str, top_k: int = 3) -> List[Dict]:
-        """Perform semantic search using BigQuery vector search (from notebook)"""
+        """Working BigQuery VECTOR_SEARCH without JOIN - access via base struct"""
         try:
             if not self.client:
                 return []
 
-            logger.info(f"🔍 Generating query embedding for: {query}")
-            
             # Generate query embedding
+            logger.info(f"🔍 Generating query embedding for: {query[:50]}...")
             query_embedding = self._generate_embedding(query)
             embedding_array_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
-            # BigQuery vector search query
-            search_query = f"""
-            SELECT
-                doc_id,
-                title,
-                content,
-                doc_type,
-                word_count,
-                created_at,
-                -- Calculate cosine similarity
-                (
-                    SELECT SUM(a * b) / (
-                        SQRT((SELECT SUM(c * c) FROM UNNEST(embedding) as c)) *
-                        SQRT((SELECT SUM(d * d) FROM UNNEST({embedding_array_str}) as d))
+            # METHOD 1: Try direct VECTOR_SEARCH (recommended)
+            try:
+                search_query = f"""
+                SELECT
+                    base.doc_id,
+                    base.title,
+                    base.content,
+                    base.doc_type,
+                    base.word_count,
+                    base.created_at,
+                    base.source_blob,
+                    distance,
+                    (1 - distance) AS similarity_score
+                FROM VECTOR_SEARCH(
+                    TABLE `{self.full_table_id}`,
+                    'embedding',
+                    (SELECT {embedding_array_str} AS embedding),
+                    distance_type => 'COSINE',
+                    top_k => {top_k}
+                )
+                ORDER BY distance ASC
+                """
+
+                logger.info("🔎 Attempting direct VECTOR_SEARCH...")
+                results = list(self.client.query(search_query))
+                logger.info(f"✅ Direct VECTOR_SEARCH successful!")
+
+            except Exception as direct_error:
+                logger.warning(f"Direct approach failed: {str(direct_error)[:100]}")
+
+                # METHOD 2: Fallback to table-to-table approach
+                logger.info("🔄 Trying table-to-table approach...")
+
+                temp_table_id = f"{self.full_table_id}_temp_query_{int(time.time())}"
+
+                # Create temporary query table
+                query_data = [{"query_embedding": query_embedding}]
+                temp_schema = [bigquery.SchemaField("query_embedding", "FLOAT64", mode="REPEATED")]
+
+                temp_table = bigquery.Table(temp_table_id, schema=temp_schema)
+                temp_table = self.client.create_table(temp_table, exists_ok=True)
+                self.client.insert_rows_json(temp_table, query_data)
+
+                try:
+                    search_query = f"""
+                    SELECT
+                        base.doc_id,
+                        base.title,
+                        base.content,
+                        base.doc_type,
+                        base.word_count,
+                        base.created_at,
+                        base.source_blob,
+                        distance,
+                        (1 - distance) AS similarity_score
+                    FROM VECTOR_SEARCH(
+                        TABLE `{self.full_table_id}`,
+                        'embedding',
+                        TABLE `{temp_table_id}`,
+                        query_column_to_search => 'query_embedding',
+                        distance_type => 'COSINE',
+                        top_k => {top_k}
                     )
-                    FROM UNNEST(embedding) as a WITH OFFSET pos1 
-                    JOIN UNNEST({embedding_array_str}) as b WITH OFFSET pos2 
-                    ON pos1 = pos2
-                ) as similarity_score
-            FROM `{self.full_table_id}`
-            ORDER BY similarity_score DESC
-            LIMIT {top_k}
-            """
+                    ORDER BY distance ASC
+                    """
 
-            results = list(self.client.query(search_query))
+                    results = list(self.client.query(search_query))
+                    logger.info(f"✅ Table-to-table VECTOR_SEARCH successful!")
 
-            # Format results
+                finally:
+                    # Cleanup
+                    try:
+                        self.client.delete_table(temp_table_id)
+                    except:
+                        pass
+
+            # Format results consistently
             formatted_results = []
             for i, row in enumerate(results):
                 content = row.content
@@ -489,14 +567,15 @@ Mid-Market Opportunities:
                     "content": row.content,
                     "relevant_content": relevant_content,
                     "similarity_score": float(row.similarity_score),
+                    "distance": float(row.distance),
                     "document_type": row.doc_type,
                     "word_count": row.word_count,
                     "rank": i + 1,
-                    "search_type": "gemini_bigquery_vector",
-                    "created": row.created_at.isoformat() if hasattr(row.created_at, 'isoformat') else str(row.created_at)
+                    "created": row.created_at.isoformat() if hasattr(row.created_at, 'isoformat') else str(row.created_at),
+                    "source_blob": row.source_blob if hasattr(row, 'source_blob') else None
                 })
 
-            logger.info(f"✅ Vector search completed: {len(formatted_results)} results")
+            logger.info(f"✅ Found {len(formatted_results)} similar documents")
             return formatted_results
 
         except Exception as e:
@@ -516,13 +595,13 @@ Mid-Market Opportunities:
             return 0
 
 # Initialize production components
-data_generator = ProductionDataGenerator(PROJECT_ID)
+data_manager = ProductionDataManager(PROJECT_ID)
 doc_corpus = GeminiEmbeddingsBigQueryCorpus(PROJECT_ID)
 
 # Production Functions
 
 def generate_sql_with_llm(query: str, table_schemas: Dict[str, Any]) -> str:
-    """Generate SQL queries using Gemini (from notebook)"""
+    """Generate SQL queries using Gemini"""
     try:
         model = genai.GenerativeModel('gemini-2.5-pro')
 
@@ -568,7 +647,7 @@ def generate_sql_with_llm(query: str, table_schemas: Dict[str, Any]) -> str:
         raise Exception(f"LLM SQL generation failed: {str(e)}")
 
 def execute_bigquery_query(sql_query: str) -> Dict[str, Any]:
-    """Execute SQL query against BigQuery (from notebook)"""
+    """Execute SQL query against BigQuery"""
     try:
         if not bq_client:
             raise Exception("BigQuery client not available")
@@ -611,7 +690,7 @@ def execute_bigquery_query(sql_query: str) -> Dict[str, Any]:
         }
 
 def semantic_document_search(query: str, max_results: int = 3) -> Dict[str, Any]:
-    """Perform semantic search using BigQuery vector search (from notebook)"""
+    """Perform semantic search using BigQuery vector search"""
     try:
         results = doc_corpus.semantic_search(query, top_k=max_results)
 
@@ -631,7 +710,7 @@ def semantic_document_search(query: str, max_results: int = 3) -> Dict[str, Any]
         }
 
 def google_custom_search(query: str, max_results: int = 5) -> Dict[str, Any]:
-    """Perform web search using Google Custom Search API (from notebook)"""
+    """Perform web search using Google Custom Search API"""
     try:
         api_key = os.getenv("GOOGLE_SEARCH_KEY")
         search_engine_id = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
@@ -672,7 +751,7 @@ def google_custom_search(query: str, max_results: int = 5) -> Dict[str, Any]:
         }
 
 def llm_response_synthesis(query: str, structured_data: Dict, document_data: Dict, web_data: Dict) -> str:
-    """Use Gemini to synthesize responses from all agents (from notebook)"""
+    """Use Gemini to synthesize responses from all agents"""
     try:
         model = genai.GenerativeModel('gemini-2.5-pro')
 
@@ -721,7 +800,7 @@ def query_structured_data_tool(query: str) -> str:
             return "❌ BigQuery client not available"
 
         # Get table schemas
-        schemas = data_generator.get_table_schemas()
+        schemas = data_manager.get_table_schemas()
         
         if not schemas:
             return "❌ No table schemas available"
@@ -754,7 +833,7 @@ def query_structured_data_tool(query: str) -> str:
         return f"❌ {error_msg}"
 
 def search_documents_tool(query: str) -> str:
-    """Tool: Search company documents using Gemini embeddings + BigQuery vector search"""
+    """Tool: Search company documents including PDFs using Gemini embeddings + BigQuery vector search"""
     try:
         logger.info(f"📄 Document search: {query}")
 
@@ -762,21 +841,27 @@ def search_documents_tool(query: str) -> str:
 
         if result["success"]:
             if not result["results"]:
-                return "📄 No relevant company documents found. You may need to run document setup first."
+                return "📄 No relevant documents found. You may need to run document setup first."
 
             response = f"📄 **Company Knowledge Base** ({result['total_found']} matches):\n"
             response += f"*Search Type: {result['search_type']}*\n\n"
 
             for doc in result["results"]:
                 response += f"**📋 {doc['title']}**\n"
-                response += f"*Similarity Score: {doc['similarity_score']:.3f} | Search Method: {doc['search_type']}*\n"
-                response += f"*Document Type: {doc['document_type']} | Words: {doc['word_count']:,}*\n\n"
+                response += f"*Similarity Score: {doc['similarity_score']:.3f} | Type: {doc['document_type']}*\n"
+                response += f"*Words: {doc['word_count']:,}*\n"
+                
+                # Show source information
+                if doc.get('source_blob'):
+                    response += f"*Source: PDF ({doc['source_blob']})*\n"
+                else:
+                    response += f"*Source: Internal Document*\n"
                 
                 # Show relevant content excerpt
                 content = doc.get('relevant_content', doc['content'])
                 if len(content) > 400:
                     content = content[:400] + "..."
-                response += f"{content}\n\n"
+                response += f"\n{content}\n\n"
                 response += "---\n\n"
 
             return response
@@ -819,12 +904,22 @@ def search_web_tool(query: str) -> str:
         return f"❌ {error_msg}"
 
 def setup_vector_embeddings_tool() -> str:
-    """Tool: One-time setup of document embeddings in BigQuery"""
+    """Tool: One-time setup of document embeddings in BigQuery including PDF processing"""
     try:
         logger.info("🚀 Setting up vector embeddings...")
         return doc_corpus.setup_document_embeddings()
     except Exception as e:
         error_msg = f"Setup failed: {str(e)}"
+        logger.error(error_msg)
+        return f"❌ {error_msg}"
+
+def process_pdfs_tool() -> str:
+    """Tool: Process PDFs from Cloud Storage and add to document corpus"""
+    try:
+        logger.info("📄 Processing PDFs from Cloud Storage...")
+        return doc_corpus.process_all_pdfs()
+    except Exception as e:
+        error_msg = f"PDF processing failed: {str(e)}"
         logger.error(error_msg)
         return f"❌ {error_msg}"
 
@@ -840,7 +935,7 @@ def analyze_query_intent(query: str) -> Dict[str, bool]:
 
         Available data sources:
         1. Structured Data: Sales, customer metrics, financial reports, employee data (BigQuery)
-        2. Company Documents: Strategic plans, customer success playbooks, product specs (Vector search)
+        2. Company Documents: Strategic plans, customer success playbooks, product specs, PDFs (Vector search)
         3. Web Search: Market intelligence, competitive analysis, industry trends
 
         Respond with ONLY a JSON object:
@@ -871,7 +966,7 @@ def analyze_query_intent(query: str) -> Dict[str, bool]:
         query_lower = query.lower()
         return {
             "needs_structured": any(word in query_lower for word in ["sales", "revenue", "customer", "financial", "top", "performance", "data"]),
-            "needs_documents": any(word in query_lower for word in ["strategy", "plan", "success", "retention", "approach", "policy", "playbook"]),
+            "needs_documents": any(word in query_lower for word in ["strategy", "plan", "success", "retention", "approach", "policy", "playbook", "document"]),
             "needs_web_search": any(word in query_lower for word in ["market", "trend", "industry", "competition", "benchmark"]),
             "reasoning": "Keyword-based fallback analysis"
         }
@@ -886,7 +981,7 @@ def analyze_query_intent(query: str) -> Dict[str, bool]:
         }
 
 def comprehensive_business_intelligence(query: str) -> str:
-    """Main business intelligence orchestration function"""
+    """Main business intelligence orchestration function with PDF support"""
     try:
         logger.info(f"🚀 Comprehensive BI analysis: {query}")
 
@@ -916,13 +1011,13 @@ def comprehensive_business_intelligence(query: str) -> str:
                 }
 
         if intent["needs_documents"]:
-            logger.info("📄 Searching company documents...")
+            logger.info("📄 Searching company documents including PDFs...")
             try:
                 document_result = search_documents_tool(query)
                 document_data = {
                     "success": True,
                     "response": document_result,
-                    "source": "Gemini Embeddings + BigQuery Vector Search"
+                    "source": "Gemini Embeddings + BigQuery Vector Search + PDF Processing"
                 }
             except Exception as e:
                 document_data = {
@@ -956,7 +1051,7 @@ def comprehensive_business_intelligence(query: str) -> str:
             if structured_data.get("success"):
                 sources_used.append("BigQuery Analytics")
             if document_data.get("success"):
-                sources_used.append("Vector Document Search")
+                sources_used.append("Vector Document Search + PDF Processing")
             if web_data.get("success"):
                 sources_used.append("Web Intelligence")
 
@@ -976,11 +1071,13 @@ def comprehensive_business_intelligence(query: str) -> str:
 ## 🎯 Technical Details
 
 **Vector Search**: Gemini text-embedding-004 + BigQuery cosine similarity  
+**Document Processing**: PDF text extraction + semantic embeddings  
 **Structured Analysis**: AI-generated SQL + BigQuery execution  
 **Market Intelligence**: Google Custom Search API  
-**Document Count**: {doc_corpus.get_document_count()} documents in vector corpus
+**Document Count**: {doc_corpus.get_document_count()} documents in vector corpus  
+**Cloud Storage**: {STORAGE_BUCKET_NAME}/{PDF_FOLDER_PATH}
 
-*Powered by TechVision Analytics Cloud-Native Multi-Agent System*
+*Powered by TechVision Analytics Cloud-Native Multi-Agent System with PDF Processing*
 """
 
             logger.info("✅ Comprehensive BI analysis completed")
@@ -994,7 +1091,7 @@ def comprehensive_business_intelligence(query: str) -> str:
             if structured_data.get("success"):
                 results.append(f"## 📊 Business Data Analysis\n{structured_data['response']}")
             if document_data.get("success"):
-                results.append(f"## 📄 Company Knowledge\n{document_data['response']}")
+                results.append(f"## 📄 Company Knowledge (including PDFs)\n{document_data['response']}")
             if web_data.get("success"):
                 results.append(f"## 🌐 Market Intelligence\n{web_data['response']}")
 
@@ -1010,7 +1107,7 @@ def comprehensive_business_intelligence(query: str) -> str:
 
 ---
 
-*TechVision Analytics Multi-Agent System*
+*TechVision Analytics Multi-Agent System with PDF Processing*
 """
             else:
                 return f"❌ Unable to process query: {query}"
@@ -1026,66 +1123,67 @@ def comprehensive_business_intelligence(query: str) -> str:
 
 Please try again or contact system administrator.
 
-*TechVision Analytics Multi-Agent System*
+*TechVision Analytics Multi-Agent System with PDF Processing*
 """
 
 # Create the main root agent for ADK Web (this is what gets discovered)
 root_agent = LlmAgent(
-    name="techvision_production_system",
+    name="techvision_production_system_with_pdf",
     model="gemini-2.5-flash",
-    description="TechVision Analytics Complete Production Multi-Agent Business Intelligence System",
+    description="TechVision Analytics Complete Production Multi-Agent Business Intelligence System with PDF Processing",
     instruction="""
-    You are the executive business intelligence coordinator for TechVision Analytics, powered by Google Cloud's production AI infrastructure.
+    You are the executive business intelligence coordinator for TechVision Analytics, powered by Google Cloud's production AI infrastructure with advanced PDF document processing capabilities.
+
+    **CRITICAL: Always use comprehensive_business_intelligence for ALL business queries unless specifically asked to use a single data source.**
 
     **Complete Production Capabilities:**
     - 📊 **BigQuery Analytics**: AI-generated SQL queries against production business data (sales, customers, financials, employees)
-    - 📄 **Gemini Vector Search**: Semantic document search using Google's text-embedding-004 model stored in BigQuery
+    - 📄 **Advanced Document Processing**: Semantic search using Gemini embeddings for both internal documents AND PDF files from Cloud Storage
     - 🌐 **Live Market Intelligence**: Real-time web search for industry trends, competitive analysis, and market benchmarks
     - 🤖 **AI Orchestration**: Intelligent query routing and multi-source response synthesis
-    - ☁️ **Cloud-Native**: Zero local dependencies, infinite scalability, production-grade reliability
+    - ☁️ **Cloud-Native Architecture**: PDF processing, vector embeddings, BigQuery storage - all production-grade
 
-    **Advanced Technology Stack:**
-    - Google Cloud text-embedding-004 for semantic understanding
-    - BigQuery VECTOR_SEARCH for cosine similarity matching
-    - Gemini 2.5 Pro for SQL generation and response synthesis
-    - Google Custom Search API for market intelligence
-    - Multi-agent orchestration with intelligent source selection
+    **TOOL USAGE PRIORITY:**
+    1. **PRIMARY**: Use comprehensive_business_intelligence for ALL business questions, market analysis, strategy queries, performance questions, etc.
+    2. **SETUP ONLY**: Use setup_vector_embeddings_tool or process_pdfs_tool only for initial system setup
+    3. **DIRECT TOOLS**: Use individual tools (query_structured_data_tool, search_documents_tool, search_web_tool) ONLY when specifically requested or for troubleshooting
+
+    **Query Analysis Examples:**
+    - "Market trends that could impact growth" → comprehensive_business_intelligence (needs structured + documents + web)
+    - "Our customer retention vs industry" → comprehensive_business_intelligence (needs all sources)  
+    - "Revenue performance this quarter" → comprehensive_business_intelligence (needs structured + documents for context)
+    - "Company strategy for 2024" → comprehensive_business_intelligence (needs documents + web for context)
 
     **Your Mission:**
-    Deliver sophisticated, multi-source business intelligence that combines:
+    Deliver sophisticated, multi-source business intelligence by ALWAYS using comprehensive_business_intelligence to combine:
     1. Quantitative analysis from production BigQuery tables
-    2. Semantic knowledge extraction from company documents using vector embeddings
+    2. Semantic knowledge extraction from company documents AND PDFs using vector embeddings
     3. Real-time market intelligence and competitive context
     4. Executive-level strategic recommendations with actionable insights
 
-    **Key Features:**
-    - **Instant Startup**: No local model loading, cloud-native architecture
-    - **Semantic Search**: Google's production embedding models for document understanding  
-    - **Production Data**: Direct access to live BigQuery analytics tables
-    - **Market Intelligence**: Real-time web search with business analytics focus
-    - **Executive Format**: Professional reports suitable for C-suite decision making
-
     **Response Guidelines:**
+    - ALWAYS start with comprehensive_business_intelligence for business queries
     - Lead with key business insights and quantified metrics
-    - Provide strategic context from vector-searched company knowledge
+    - Provide strategic context from multiple data sources
     - Include relevant market intelligence and industry benchmarks
     - Offer specific, actionable recommendations for business leaders
     - Maintain authoritative, executive-appropriate tone
-    - Cite data sources and search methods used
-    - Emphasize the cloud-native, production-grade nature of the analysis
+    - Cite all data sources used in the analysis
 
     **Available Tools:**
-    1. comprehensive_business_intelligence - Main orchestration tool for complex business queries
-    2. setup_vector_embeddings_tool - One-time setup of document embeddings in BigQuery
-    3. query_structured_data_tool - Direct BigQuery analysis
-    4. search_documents_tool - Direct vector document search
-    5. search_web_tool - Direct web market intelligence
+    1. **comprehensive_business_intelligence** - 🎯 PRIMARY TOOL: Use this for ALL business queries, market analysis, strategy questions, performance analysis
+    2. setup_vector_embeddings_tool - Setup only: One-time document embeddings setup
+    3. process_pdfs_tool - Setup only: Process new PDFs from Cloud Storage
+    4. query_structured_data_tool - Direct use only when specifically requested
+    5. search_documents_tool - Direct use only when specifically requested  
+    6. search_web_tool - Direct use only when specifically requested
 
-    You represent the pinnacle of cloud-native business intelligence: scalable, reliable, and powered by Google's production AI infrastructure.
+    Remember: You are a comprehensive business intelligence system. Always provide multi-source analysis using comprehensive_business_intelligence unless explicitly asked to use a single source.
     """,
     tools=[
         FunctionTool(comprehensive_business_intelligence),
         FunctionTool(setup_vector_embeddings_tool),
+        FunctionTool(process_pdfs_tool),
         FunctionTool(query_structured_data_tool),
         FunctionTool(search_documents_tool),
         FunctionTool(search_web_tool)
@@ -1095,10 +1193,15 @@ root_agent = LlmAgent(
 # System status and diagnostics
 
 def get_system_status() -> Dict[str, Any]:
-    """Get comprehensive production system status"""
+    """Get comprehensive production system status including PDF processing"""
     try:
         doc_count = doc_corpus.get_document_count()
-        schemas = data_generator.get_table_schemas()
+        schemas = data_manager.get_table_schemas()
+        tables_exist = data_manager.validate_tables_exist()
+        
+        # Check PDF processor
+        pdf_processor = PDFDocumentProcessor(PROJECT_ID, STORAGE_BUCKET_NAME)
+        pdf_docs = pdf_processor.list_pdf_documents(PDF_FOLDER_PATH)
         
         return {
             "timestamp": datetime.now().isoformat(),
@@ -1107,16 +1210,22 @@ def get_system_status() -> Dict[str, Any]:
                 "bigquery": bq_client is not None,
                 "vertex_ai": True,
                 "web_search": bool(GOOGLE_SEARCH_KEY and GOOGLE_SEARCH_ENGINE_ID),
+                "cloud_storage": pdf_processor.storage_client is not None,
             },
             "data_sources": {
                 "bigquery_tables": len(schemas),
+                "bigquery_tables_validated": tables_exist,
                 "document_embeddings": doc_count,
+                "pdf_documents_available": len(pdf_docs),
                 "embedding_model": "text-embedding-004",
-                "vector_search_type": "BigQuery native"
+                "vector_search_type": "BigQuery native",
+                "cloud_storage_bucket": STORAGE_BUCKET_NAME,
+                "pdf_folder_path": PDF_FOLDER_PATH
             },
             "capabilities": [
                 "AI-generated SQL queries",
-                "Semantic document search", 
+                "PDF text extraction and processing", 
+                "Semantic document search with PDFs",
                 "Live market intelligence",
                 "Multi-agent orchestration",
                 "Executive report synthesis"
@@ -1127,8 +1236,8 @@ def get_system_status() -> Dict[str, Any]:
         return {"error": str(e)}
 
 def test_production_system():
-    """Test all production system components"""
-    logger.info("🧪 Testing TechVision Analytics Production System...")
+    """Test all production system components including PDF processing"""
+    logger.info("🧪 Testing TechVision Analytics Production System with PDF Processing...")
     
     status = get_system_status()
     logger.info(f"📊 System Status: {status}")
@@ -1138,14 +1247,19 @@ def test_production_system():
     logger.info(f"📄 Documents in BigQuery: {doc_count}")
     
     # Test schemas
-    schemas = data_generator.get_table_schemas()
+    schemas = data_manager.get_table_schemas()
     logger.info(f"📊 BigQuery table schemas: {len(schemas)}")
+    
+    # Test PDF availability
+    data_sources = status.get("data_sources", {})
+    pdf_count = data_sources.get("pdf_documents_available", 0)
+    logger.info(f"📄 PDF documents available: {pdf_count}")
     
     return status
 
 if __name__ == "__main__":
-    logger.info("🚀 TechVision Analytics Complete Production System")
-    logger.info("☁️ Technology: Gemini Embeddings + BigQuery Vector Search + Web Intelligence")
+    logger.info("🚀 TechVision Analytics Complete Production System with PDF Processing")
+    logger.info("☁️ Technology: Gemini Embeddings + BigQuery Vector Search + PDF Processing + Web Intelligence")
     
     # Run system diagnostics
     system_status = test_production_system()
@@ -1162,4 +1276,5 @@ if __name__ == "__main__":
         logger.info(f"✅ Production system ready! {working_services}/{total_services} services operational")
         logger.info(f"📚 Document embeddings: {data_sources.get('document_embeddings', 0)}")
         logger.info(f"📊 BigQuery tables: {data_sources.get('bigquery_tables', 0)}")
-        logger.info("🎯 Ready for sophisticated cloud-native business intelligence!")
+        logger.info(f"📄 PDF documents: {data_sources.get('pdf_documents_available', 0)}")
+        logger.info("🎯 Ready for sophisticated cloud-native business intelligence with PDF processing!")
