@@ -1,4 +1,4 @@
-# techvision_agent/agent.py (Complete Production System with PDF Processing)
+# techvision_agent/agent.py (Complete Production System with PDF Processing and Text Chunking)
 import os
 import json
 import pandas as pd
@@ -203,17 +203,24 @@ class PDFDocumentProcessor:
             raise Exception(f"Failed to download and process PDF {blob_name}: {str(e)}")
 
 class GeminiEmbeddingsBigQueryCorpus:
-    """Production document corpus using Gemini embeddings and BigQuery vector search with PDF integration"""
+    """Production document corpus using Gemini embeddings and BigQuery vector search with PDF integration and text chunking"""
 
-    def __init__(self, project_id: str, dataset_id: str = "techvision_analytics"):
-        logger.info("📚 Initializing Gemini + BigQuery document corpus with PDF processing...")
+    def __init__(self, project_id: str, dataset_id: str = "techvision_analytics", chunk_size: int = 500, chunk_overlap: int = 100):
+        logger.info("📚 Initializing Gemini + BigQuery document corpus with PDF processing and text chunking...")
 
         self.project_id = project_id
         self.dataset_id = dataset_id
-        self.table_id = "document_embeddings_new"
+        # Use new table name to avoid schema conflicts
+        self.table_id = "document_embeddings"
         self.full_table_id = f"{project_id}.{dataset_id}.{self.table_id}"
+        
+        # Chunking parameters
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        
         self.client = bq_client
         self.document_count = 0
+        self.chunk_count = 0
 
         # Production documents from original system (fallback)
         self.production_documents = {
@@ -277,29 +284,100 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
         self._create_embeddings_table()
 
     def _create_embeddings_table(self):
-        """Create BigQuery table for storing document embeddings with PDF support"""
+        """Create BigQuery table for storing document embeddings with chunk support"""
         if not self.client:
             logger.error("BigQuery client not available")
             return
 
         try:
+            # Try to delete existing table first (for clean start)
+            # try:
+            #     self.client.delete_table(self.full_table_id, not_found_ok=True)
+            #     logger.info(f"🗑️ Cleaned up existing table (if any): {self.full_table_id}")
+            # except Exception as e:
+            #     logger.warning(f"Could not delete existing table (this is okay): {str(e)}")
+
+            # Define table schema with chunking support
             schema = [
                 bigquery.SchemaField("doc_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("chunk_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("chunk_index", "INTEGER", mode="REQUIRED"),
                 bigquery.SchemaField("title", "STRING", mode="REQUIRED"),
                 bigquery.SchemaField("content", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("full_content", "STRING", mode="NULLABLE"),
                 bigquery.SchemaField("doc_type", "STRING", mode="REQUIRED"),
                 bigquery.SchemaField("word_count", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("total_word_count", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("chunk_start_pos", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("chunk_end_pos", "INTEGER", mode="REQUIRED"),
                 bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
                 bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
-                bigquery.SchemaField("source_blob", "STRING", mode="NULLABLE"),  # New field for PDF source
+                bigquery.SchemaField("source_blob", "STRING", mode="NULLABLE"),
             ]
 
             table = bigquery.Table(self.full_table_id, schema=schema)
-            table = self.client.create_table(table, exists_ok=True)
-            logger.info(f"✅ Document embeddings table ready: {self.full_table_id}")
+            table = self.client.create_table(table, exists_ok=False)
+            logger.info(f"✅ Document embeddings table created with chunking support: {self.full_table_id}")
 
         except Exception as e:
             logger.error(f"Failed to create embeddings table: {str(e)}")
+
+    def _chunk_text(self, text: str) -> List[Dict[str, any]]:
+        """Split text into overlapping chunks"""
+        try:
+            chunks = []
+            text_length = len(text)
+            
+            if text_length <= self.chunk_size:
+                # If text is smaller than chunk size, return as single chunk
+                chunks.append({
+                    'content': text,
+                    'start_pos': 0,
+                    'end_pos': text_length,
+                    'chunk_index': 0
+                })
+                return chunks
+            
+            start = 0
+            chunk_index = 0
+            
+            while start < text_length:
+                # Calculate end position
+                end = min(start + self.chunk_size, text_length)
+                
+                # If this isn't the last chunk, try to break at word boundary
+                if end < text_length:
+                    # Look for last space within reasonable distance
+                    last_space = text.rfind(' ', start, end)
+                    if last_space > start + (self.chunk_size * 0.8):  # If space is found in last 20% of chunk
+                        end = last_space
+                
+                chunk_content = text[start:end].strip()
+                
+                if chunk_content:  # Only add non-empty chunks
+                    chunks.append({
+                        'content': chunk_content,
+                        'start_pos': start,
+                        'end_pos': end,
+                        'chunk_index': chunk_index
+                    })
+                    chunk_index += 1
+                
+                # Calculate next start position with overlap
+                if end >= text_length:
+                    break
+                    
+                start = max(start + 1, end - self.chunk_overlap)
+                
+                # Prevent infinite loop
+                if start >= text_length:
+                    break
+            
+            logger.info(f"🔄 Text chunked into {len(chunks)} pieces (chunk_size={self.chunk_size}, overlap={self.chunk_overlap})")
+            return chunks
+            
+        except Exception as e:
+            raise Exception(f"Failed to chunk text: {str(e)}")
 
     def _generate_embedding(self, text: str) -> List[float]:
         """Generate embedding using Gemini embedding model"""
@@ -315,7 +393,7 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
             raise
 
     def add_pdf_document(self, pdf_data: Dict[str, str]):
-        """Add PDF document to BigQuery with Gemini embeddings"""
+        """Add PDF document to BigQuery with Gemini embeddings and text chunking - with enhanced logging"""
         try:
             if not self.client:
                 raise Exception("BigQuery client not available")
@@ -324,38 +402,142 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
             doc_id = f"PDF_{self.document_count:03d}"
             self.document_count += 1
 
-            # Generate embedding using Gemini
-            logger.info(f"🧠 Generating Gemini embedding for: {pdf_data['title'][:50]}...")
-            embedding = self._generate_embedding(pdf_data['content'])
+            # Chunk the document content
+            chunks = self._chunk_text(pdf_data['content'])
+            
+            logger.info(f"\n📄 PROCESSING DOCUMENT: {pdf_data['title']}")
+            logger.info(f"📊 Document Stats:")
+            logger.info(f"   • Total Characters: {len(pdf_data['content']):,}")
+            logger.info(f"   • Total Words: {pdf_data['word_count']:,}")
+            logger.info(f"   • Generated Chunks: {len(chunks)}")
+            logger.info(f"   • Chunk Size Config: {self.chunk_size} chars")
+            logger.info(f"   • Overlap Config: {self.chunk_overlap} chars")
 
-            # Prepare row data with proper datetime formatting
-            row_data = {
-                "doc_id": doc_id,
-                "title": pdf_data['title'],
-                "content": pdf_data['content'],
-                "doc_type": "pdf",
-                "word_count": pdf_data['word_count'],
-                "created_at": datetime.now().isoformat(),
-                "embedding": embedding,
-                "source_blob": pdf_data.get('blob_name', '')
-            }
+            # Process each chunk
+            rows_to_insert = []
+            logger.info(f"\n🔄 CHUNK PROCESSING DETAILS:")
+            
+            for chunk_data in chunks:
+                # Generate unique chunk ID
+                chunk_id = f"{doc_id}_CHUNK_{chunk_data['chunk_index']:03d}"
+                
+                # Show chunk details
+                logger.info(f"   📋 Chunk {chunk_data['chunk_index']+1}/{len(chunks)}:")
+                logger.info(f"      🆔 ID: {chunk_id}")
+                logger.info(f"      📏 Position: {chunk_data['start_pos']}-{chunk_data['end_pos']} chars")
+                logger.info(f"      💬 Length: {len(chunk_data['content'])} chars")
+                logger.info(f"      📝 Words: {len(chunk_data['content'].split())} words")
+                
+                # Show content preview
+                preview = chunk_data['content'][:100].replace('\n', ' ').strip()
+                logger.info(f"      🔍 Preview: {preview}...")
+                
+                # Generate embedding for this chunk
+                logger.info(f"      🧠 Generating embedding...")
+                embedding = self._generate_embedding(chunk_data['content'])
+                logger.info(f"      ✅ Embedding: {len(embedding)} dimensions")
 
-            # Insert into BigQuery
+                # Prepare row data
+                row_data = {
+                    "doc_id": doc_id,
+                    "chunk_id": chunk_id,
+                    "chunk_index": chunk_data['chunk_index'],
+                    "title": pdf_data['title'],
+                    "content": chunk_data['content'],  # Chunk content
+                    "full_content": pdf_data['content'] if chunk_data['chunk_index'] == 0 else None,  # Store full content only in first chunk
+                    "doc_type": "pdf",
+                    "word_count": len(chunk_data['content'].split()),
+                    "total_word_count": pdf_data['word_count'] if chunk_data['chunk_index'] == 0 else None,
+                    "chunk_start_pos": chunk_data['start_pos'],
+                    "chunk_end_pos": chunk_data['end_pos'],
+                    "created_at": datetime.now().isoformat(),
+                    "embedding": embedding,
+                    "source_blob": pdf_data.get('blob_name', '')
+                }
+                
+                rows_to_insert.append(row_data)
+                self.chunk_count += 1
+
+            # Batch insert all chunks for this document
+            logger.info(f"\n💾 INSERTING INTO BIGQUERY:")
+            logger.info(f"   • Inserting {len(rows_to_insert)} chunks...")
+            
             errors = self.client.insert_rows_json(
                 self.client.get_table(self.full_table_id),
-                [row_data]
+                rows_to_insert
             )
 
             if errors:
                 raise Exception(f"BigQuery insertion errors: {errors}")
 
-            logger.info(f"✅ Added PDF document: {pdf_data['title']} (ID: {doc_id}, {len(embedding)} dimensions)")
+            logger.info(f"✅ DOCUMENT COMPLETED: {pdf_data['title']}")
+            logger.info(f"   • Document ID: {doc_id}")
+            logger.info(f"   • Chunks Created: {len(chunks)}")
+            logger.info(f"   • Embedding Dimensions: {len(embedding)} per chunk")
+            logger.info(f"   • Total Chunks in Corpus: {self.chunk_count}")
 
         except Exception as e:
             raise Exception(f"Failed to add PDF document: {str(e)}")
 
+    def add_production_document(self, doc_id: str, title: str, content: str):
+        """Add a production document with chunking"""
+        try:
+            if not self.client:
+                raise Exception("BigQuery client not available")
+
+            # Chunk the document content
+            chunks = self._chunk_text(content)
+            
+            logger.info(f"📄 Processing document: {title}")
+            logger.info(f"🔄 Generated {len(chunks)} chunks for processing")
+
+            # Process each chunk
+            rows_to_insert = []
+            for chunk_data in chunks:
+                # Generate unique chunk ID
+                chunk_id = f"{doc_id}_CHUNK_{chunk_data['chunk_index']:03d}"
+                
+                # Generate embedding for this chunk
+                logger.info(f"🧠 Generating Gemini embedding for chunk {chunk_data['chunk_index']+1}/{len(chunks)}...")
+                embedding = self._generate_embedding(chunk_data['content'])
+
+                # Prepare row data
+                row_data = {
+                    "doc_id": doc_id,
+                    "chunk_id": chunk_id,
+                    "chunk_index": chunk_data['chunk_index'],
+                    "title": title,
+                    "content": chunk_data['content'],  # Chunk content
+                    "full_content": content if chunk_data['chunk_index'] == 0 else None,  # Store full content only in first chunk
+                    "doc_type": "internal",
+                    "word_count": len(chunk_data['content'].split()),
+                    "total_word_count": len(content.split()) if chunk_data['chunk_index'] == 0 else None,
+                    "chunk_start_pos": chunk_data['start_pos'],
+                    "chunk_end_pos": chunk_data['end_pos'],
+                    "created_at": datetime.now().isoformat(),
+                    "embedding": embedding,
+                    "source_blob": None
+                }
+                
+                rows_to_insert.append(row_data)
+                self.chunk_count += 1
+
+            # Batch insert all chunks for this document
+            errors = self.client.insert_rows_json(
+                self.client.get_table(self.full_table_id),
+                rows_to_insert
+            )
+
+            if errors:
+                raise Exception(f"BigQuery insertion errors: {errors}")
+
+            logger.info(f"✅ Added internal document: {title} (ID: {doc_id}, {len(chunks)} chunks, {len(embedding)} dimensions each)")
+
+        except Exception as e:
+            raise Exception(f"Failed to add internal document: {str(e)}")
+
     def process_all_pdfs(self, folder_path: str = PDF_FOLDER_PATH):
-        """Process all PDFs from Cloud Storage and add to corpus"""
+        """Process all PDFs from Cloud Storage and add to corpus with chunking"""
         try:
             # Initialize PDF processor
             pdf_processor = PDFDocumentProcessor(PROJECT_ID, STORAGE_BUCKET_NAME)
@@ -367,7 +549,7 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                 logger.warning("No PDF documents found in the specified folder")
                 return "⚠️ No PDF documents found"
 
-            logger.info(f"📄 Processing {len(pdf_documents)} PDF documents...")
+            logger.info(f"📄 Processing {len(pdf_documents)} PDF documents with chunking...")
 
             processed_count = 0
             for i, pdf_info in enumerate(pdf_documents):
@@ -377,7 +559,7 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                     # Download and extract text
                     pdf_data = pdf_processor.download_and_extract_text(pdf_info['blob_name'])
 
-                    # Add to corpus with embeddings
+                    # Add to corpus with chunking and embeddings
                     self.add_pdf_document(pdf_data)
                     processed_count += 1
 
@@ -385,7 +567,7 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                     logger.error(f"Failed to process {pdf_info['title']}: {str(e)}")
                     continue
 
-            return f"✅ Successfully processed {processed_count}/{len(pdf_documents)} PDF documents"
+            return f"✅ Successfully processed {processed_count}/{len(pdf_documents)} PDF documents: {self.document_count} documents, {self.chunk_count} chunks total"
 
         except Exception as e:
             error_msg = f"Failed to process PDFs: {str(e)}"
@@ -393,68 +575,41 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
             return error_msg
 
     def setup_document_embeddings(self) -> str:
-        """One-time setup: Generate and store all document embeddings including PDFs"""
+        """One-time setup: Generate and store all document embeddings including PDFs with chunking"""
         try:
             if not self.client:
                 return "❌ BigQuery client not available"
 
-            logger.info("🚀 Starting document embeddings setup...")
+            logger.info("🚀 Starting document embeddings setup with chunking...")
             
             # Check if documents already exist
             try:
-                count_query = f"SELECT COUNT(*) as total FROM `{self.full_table_id}`"
-                result = list(self.client.query(count_query))
-                existing_count = result[0].total if result else 0
+                doc_stats = self.get_document_count()
+                existing_docs = doc_stats['documents']
+                existing_chunks = doc_stats['chunks']
                 
-                if existing_count > 0:
+                if existing_docs > 0:
                     # Also process PDFs if they exist
                     pdf_result = self.process_all_pdfs()
-                    return f"✅ Document embeddings already exist: {existing_count} documents. {pdf_result}"
+                    return f"✅ Document embeddings already exist: {existing_docs} documents ({existing_chunks} chunks). {pdf_result}"
             except:
                 pass  # Table might not exist yet
 
-            processed_docs = []
+            response_messages = []
             
-            # Process built-in documents
-            for doc_id, (title, content) in enumerate(self.production_documents.items()):
+            # Process built-in documents with chunking
+            for doc_index, (title, content) in enumerate(self.production_documents.items()):
                 try:
-                    logger.info(f"🧠 Generating Gemini embedding for: {title}")
-                    
-                    # Generate embedding using Gemini
-                    embedding = self._generate_embedding(content)
-                    
-                    processed_docs.append({
-                        "doc_id": f"doc_{doc_id:03d}",
-                        "title": title,
-                        "content": content,
-                        "doc_type": "internal",
-                        "word_count": len(content.split()),
-                        "created_at": datetime.now(),
-                        "embedding": embedding,
-                        "source_blob": None
-                    })
-                    
-                    logger.info(f"✅ Generated embedding for: {title} ({len(embedding)} dimensions)")
+                    doc_id = f"doc_{doc_index:03d}"
+                    self.add_production_document(doc_id, title, content)
+                    logger.info(f"✅ Generated embeddings for: {title}")
                     
                 except Exception as e:
                     logger.error(f"Failed to generate embedding for {title}: {str(e)}")
                     continue
             
-            response_messages = []
-            
-            if processed_docs:
-                # Insert into BigQuery
-                errors = self.client.insert_rows_json(
-                    self.client.get_table(self.full_table_id),
-                    processed_docs
-                )
-                
-                if errors:
-                    logger.error(f"BigQuery insertion errors: {errors}")
-                    response_messages.append(f"❌ Failed to store embeddings: {errors}")
-                else:
-                    logger.info(f"✅ Stored {len(processed_docs)} document embeddings in BigQuery")
-                    response_messages.append(f"✅ Successfully stored {len(processed_docs)} documents with Gemini embeddings")
+            if self.document_count > 0:
+                response_messages.append(f"✅ Successfully stored {self.document_count} documents ({self.chunk_count} chunks) with Gemini embeddings")
             
             # Also process PDFs
             pdf_result = self.process_all_pdfs()
@@ -467,8 +622,8 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
             logger.error(error_msg)
             return error_msg
 
-    def semantic_search(self, query: str, top_k: int = 3) -> List[Dict]:
-        """Working BigQuery VECTOR_SEARCH without JOIN - access via base struct"""
+    def semantic_search(self, query: str, top_k: int = 7) -> List[Dict]:
+        """Enhanced semantic search working with chunked documents - with detailed chunk visibility"""
         try:
             if not self.client:
                 return []
@@ -478,15 +633,21 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
             query_embedding = self._generate_embedding(query)
             embedding_array_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
-            # METHOD 1: Try direct VECTOR_SEARCH (recommended)
+            # Updated search query to work with chunks
             try:
                 search_query = f"""
                 SELECT
                     base.doc_id,
+                    base.chunk_id,
+                    base.chunk_index,
                     base.title,
                     base.content,
+                    base.full_content,
                     base.doc_type,
                     base.word_count,
+                    base.total_word_count,
+                    base.chunk_start_pos,
+                    base.chunk_end_pos,
                     base.created_at,
                     base.source_blob,
                     distance,
@@ -496,19 +657,19 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                     'embedding',
                     (SELECT {embedding_array_str} AS embedding),
                     distance_type => 'COSINE',
-                    top_k => {top_k}
+                    top_k => {top_k * 3}  -- Get more chunks to potentially represent more documents
                 )
                 ORDER BY distance ASC
                 """
 
-                logger.info("🔎 Attempting direct VECTOR_SEARCH...")
+                logger.info("🔎 Performing VECTOR_SEARCH on chunked documents...")
                 results = list(self.client.query(search_query))
-                logger.info(f"✅ Direct VECTOR_SEARCH successful!")
+                logger.info(f"✅ Vector search successful! Found {len(results)} total chunks")
 
             except Exception as direct_error:
-                logger.warning(f"Direct approach failed: {str(direct_error)[:100]}")
+                logger.warning(f"⚠️ Direct approach failed: {str(direct_error)[:100]}")
 
-                # METHOD 2: Fallback to table-to-table approach
+                # Fallback to table-to-table approach
                 logger.info("🔄 Trying table-to-table approach...")
 
                 temp_table_id = f"{self.full_table_id}_temp_query_{int(time.time())}"
@@ -525,10 +686,16 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                     search_query = f"""
                     SELECT
                         base.doc_id,
+                        base.chunk_id,
+                        base.chunk_index,
                         base.title,
                         base.content,
+                        base.full_content,
                         base.doc_type,
                         base.word_count,
+                        base.total_word_count,
+                        base.chunk_start_pos,
+                        base.chunk_end_pos,
                         base.created_at,
                         base.source_blob,
                         distance,
@@ -539,7 +706,7 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                         TABLE `{temp_table_id}`,
                         query_column_to_search => 'query_embedding',
                         distance_type => 'COSINE',
-                        top_k => {top_k}
+                        top_k => {top_k * 3}
                     )
                     ORDER BY distance ASC
                     """
@@ -554,49 +721,163 @@ Blue (Champion): >95% utilization, active advocate, referring new customers
                     except:
                         pass
 
-            # Format results consistently
+            # Enhanced logging: Show all found chunks before filtering
+            if results:
+                logger.info("\n📋 DETAILED CHUNK ANALYSIS:")
+                logger.info("=" * 80)
+                for i, row in enumerate(results):
+                    logger.info(f"\n🔍 CHUNK {i+1}/{len(results)}:")
+                    logger.info(f"   📄 Document: {row.title}")
+                    logger.info(f"   🆔 Doc ID: {row.doc_id}")
+                    logger.info(f"   🧩 Chunk ID: {row.chunk_id}")
+                    logger.info(f"   📍 Chunk Index: {row.chunk_index}")
+                    logger.info(f"   📏 Position: {row.chunk_start_pos}-{row.chunk_end_pos} chars")
+                    logger.info(f"   📊 Similarity Score: {float(row.similarity_score):.4f}")
+                    logger.info(f"   📐 Distance: {float(row.distance):.4f}")
+                    logger.info(f"   💬 Word Count: {row.word_count}")
+                    if row.source_blob:
+                        logger.info(f"   📎 PDF Source: {row.source_blob}")
+                    
+                    # Show chunk content preview (first 150 chars)
+                    chunk_preview = row.content[:150].replace('\n', ' ').strip()
+                    logger.info(f"   📝 Content Preview: {chunk_preview}...")
+                    logger.info("   " + "-" * 60)
+
+            # Format results with chunk awareness
             formatted_results = []
+            seen_docs = set()
+            
+            logger.info(f"\n🎯 FILTERING TO TOP {top_k} RESULTS:")
+            logger.info("=" * 50)
+            
             for i, row in enumerate(results):
-                content = row.content
-                sentences = [s.strip() for s in content.split('.') if s.strip()]
-                relevant_content = '. '.join(sentences[:5]) + '...' if len(sentences) > 5 else content
+                # Limit to requested number of unique documents/chunks
+                if len(formatted_results) >= top_k:
+                    break
+                    
+                logger.info(f"\n✅ SELECTED CHUNK {len(formatted_results)+1}:")
+                logger.info(f"   📄 {row.title}")
+                logger.info(f"   🧩 {row.chunk_id} (Index: {row.chunk_index})")
+                logger.info(f"   📊 Similarity: {float(row.similarity_score):.4f}")
+                    
+                # Create a comprehensive content preview
+                chunk_content = row.content
+                
+                # For context, show some surrounding text if available
+                if hasattr(row, 'full_content') and row.full_content:
+                    full_content = row.full_content
+                    start_pos = max(0, row.chunk_start_pos - 100)  # Add some context before
+                    end_pos = min(len(full_content), row.chunk_end_pos + 100)  # Add some context after
+                    context_content = full_content[start_pos:end_pos]
+                    relevant_content = f"...{context_content}..." if start_pos > 0 or end_pos < len(full_content) else context_content
+                    logger.info(f"   🎯 Enhanced with context from position {start_pos}-{end_pos}")
+                else:
+                    # Fallback to chunk content with preview
+                    sentences = [s.strip() for s in chunk_content.split('.') if s.strip()]
+                    relevant_content = '. '.join(sentences[:3]) + '...' if len(sentences) > 3 else chunk_content
+                    logger.info(f"   📝 Using chunk content only (no full document available)")
 
                 formatted_results.append({
                     "id": row.doc_id,
+                    "chunk_id": row.chunk_id,
+                    "chunk_index": row.chunk_index,
                     "title": row.title,
-                    "content": row.content,
-                    "relevant_content": relevant_content,
+                    "content": chunk_content,  # The actual matching chunk
+                    "relevant_content": relevant_content,  # Enhanced preview with context
+                    "full_content": row.full_content if hasattr(row, 'full_content') else None,
                     "similarity_score": float(row.similarity_score),
                     "distance": float(row.distance),
                     "document_type": row.doc_type,
                     "word_count": row.word_count,
-                    "rank": i + 1,
+                    "total_word_count": row.total_word_count if hasattr(row, 'total_word_count') else None,
+                    "chunk_position": f"chars {row.chunk_start_pos}-{row.chunk_end_pos}",
+                    "rank": len(formatted_results) + 1,
                     "created": row.created_at.isoformat() if hasattr(row.created_at, 'isoformat') else str(row.created_at),
                     "source_blob": row.source_blob if hasattr(row, 'source_blob') else None
                 })
 
-            logger.info(f"✅ Found {len(formatted_results)} similar documents")
+            logger.info(f"\n✅ FINAL RESULT: Selected {len(formatted_results)} chunks from {len(set([r.doc_id for r in results]))} unique documents")
+            logger.info("=" * 80)
             return formatted_results
 
         except Exception as e:
             logger.error(f"Semantic search failed: {str(e)}")
             return []
 
-    def get_document_count(self) -> int:
-        """Get total number of documents in corpus"""
+    def get_document_count(self) -> Dict[str, int]:
+        """Get total number of documents and chunks in corpus - with detailed breakdown"""
         try:
             if not self.client:
-                return 0
-            count_query = f"SELECT COUNT(*) as total FROM `{self.full_table_id}`"
-            result = list(self.client.query(count_query))
-            return result[0].total if result else 0
+                return {"documents": 0, "chunks": 0, "breakdown": []}
+                
+            # Count unique documents
+            doc_count_query = f"SELECT COUNT(DISTINCT doc_id) as total_docs FROM `{self.full_table_id}`"
+            doc_result = list(self.client.query(doc_count_query))
+            
+            # Count total chunks
+            chunk_count_query = f"SELECT COUNT(*) as total_chunks FROM `{self.full_table_id}`"
+            chunk_result = list(self.client.query(chunk_count_query))
+            
+            # Get document breakdown by type
+            breakdown_query = f"""
+            SELECT 
+                doc_type,
+                COUNT(DISTINCT doc_id) as documents,
+                COUNT(*) as chunks,
+                AVG(word_count) as avg_chunk_words,
+                MIN(word_count) as min_chunk_words,
+                MAX(word_count) as max_chunk_words
+            FROM `{self.full_table_id}` 
+            GROUP BY doc_type
+            ORDER BY documents DESC
+            """
+            breakdown_result = list(self.client.query(breakdown_query))
+            
+            document_stats = {
+                "documents": doc_result[0].total_docs if doc_result else 0,
+                "chunks": chunk_result[0].total_chunks if chunk_result else 0,
+                "breakdown": []
+            }
+            
+            if breakdown_result:
+                for row in breakdown_result:
+                    document_stats["breakdown"].append({
+                        "type": row.doc_type,
+                        "documents": row.documents,
+                        "chunks": row.chunks,
+                        "avg_chunk_words": round(row.avg_chunk_words, 1),
+                        "min_chunk_words": row.min_chunk_words,
+                        "max_chunk_words": row.max_chunk_words
+                    })
+            
+            # Print detailed stats
+            logger.info(f"\n📊 DOCUMENT CORPUS STATISTICS:")
+            logger.info(f"   📚 Total Documents: {document_stats['documents']}")
+            logger.info(f"   🧩 Total Chunks: {document_stats['chunks']}")
+            logger.info(f"   📈 Avg Chunks per Document: {document_stats['chunks'] / max(document_stats['documents'], 1):.1f}")
+            
+            if document_stats["breakdown"]:
+                logger.info(f"\n📋 BREAKDOWN BY TYPE:")
+                for item in document_stats["breakdown"]:
+                    logger.info(f"   {item['type'].upper()}:")
+                    logger.info(f"      • Documents: {item['documents']}")
+                    logger.info(f"      • Chunks: {item['chunks']}")
+                    logger.info(f"      • Avg words/chunk: {item['avg_chunk_words']}")
+                    logger.info(f"      • Word range: {item['min_chunk_words']}-{item['max_chunk_words']}")
+            
+            return document_stats
+            
         except Exception as e:
             logger.warning(f"Failed to get document count: {str(e)}")
-            return 0
+            return {"documents": 0, "chunks": 0, "breakdown": []}
 
-# Initialize production components
+# Initialize production components with chunking
 data_manager = ProductionDataManager(PROJECT_ID)
-doc_corpus = GeminiEmbeddingsBigQueryCorpus(PROJECT_ID)
+doc_corpus = GeminiEmbeddingsBigQueryCorpus(
+    PROJECT_ID, 
+    chunk_size=500, 
+    chunk_overlap=100
+)
 
 # Production Functions
 
@@ -619,7 +900,7 @@ def generate_sql_with_llm(query: str, table_schemas: Dict[str, Any]) -> str:
 
         Requirements:
         1. Generate ONLY the SQL query, no explanation
-        2. Use proper BigQuery syntax
+        2. Use proper BigQuery syntax with correct table names (no extra asterisks or formatting)
         3. Include appropriate WHERE clauses, ORDER BY, and LIMIT as needed
         4. When filtering by date columns, use PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', column_name)
         5. Handle date ranges correctly using parsed timestamps
@@ -627,7 +908,31 @@ def generate_sql_with_llm(query: str, table_schemas: Dict[str, Any]) -> str:
         7. When comparing TIMESTAMP with DATE, cast TIMESTAMP to DATE
         8. Ensure query is safe (no DROP, DELETE, TRUNCATE operations)
         9. Use table aliases for readability
-        10. Use LIMIT 10 for testing
+        10. **CRITICAL: Always use SAFE_DIVIDE() instead of division (/) to prevent division by zero errors**
+        11. **Add HAVING COUNT(*) > 0 clauses when doing aggregations to ensure non-empty results**
+        12. **Use COALESCE() for null handling in calculations**
+        13. ONLY use tables: customer_metrics, sales_data, financial_reports, employee_data
+        14. DO NOT reference vertex_ai, ML functions, or document_embeddings tables
+        15. Use LIMIT 10 for testing unless specifically asked for more
+
+        EXAMPLE of safe division:
+        SAFE_DIVIDE(COUNTIF(condition), COUNT(*)) * 100 AS percentage
+
+        EXAMPLE of safe aggregation:
+        SELECT ... FROM table GROUP BY column HAVING COUNT(*) > 0
+
+        CRITICAL RULES - YOU MUST FOLLOW THESE:
+        - ONLY use these tables from dataset `{PROJECT_ID}.techvision_analytics`:
+          * customer_metrics (customer data, satisfaction, churn risk)
+          * sales_data (revenue, deals, performance)  
+          * financial_reports (financial metrics)
+          * employee_data (staff information)
+        - DO NOT use any of these - they don't exist:
+          * vertex_ai dataset or models
+          * ML.GENERATE_EMBEDDING functions
+          * document_embeddings tables
+          * Any ML or AI functions
+        - Write SIMPLE SELECT queries only using standard SQL functions
 
         SQL Query:
         """
@@ -640,6 +945,32 @@ def generate_sql_with_llm(query: str, table_schemas: Dict[str, Any]) -> str:
             sql_query = sql_query[6:]
         if sql_query.endswith("```"):
             sql_query = sql_query[:-3]
+
+        # Validate and fix common issues
+        sql_query = sql_query.strip()
+        
+        # Remove problematic patterns
+        if "vertex_ai" in sql_query.lower() or "ml.generate_embedding" in sql_query.lower():
+            logger.warning("SQL query contained invalid ML references, using fallback")
+            # Fallback to simple customer metrics query
+            sql_query = f"""
+            SELECT 
+                churn_risk,
+                COUNT(*) as customer_count,
+                ROUND(AVG(satisfaction_score), 2) as avg_satisfaction,
+                ROUND(AVG(lifetime_value), 2) as avg_lifetime_value
+            FROM `{PROJECT_ID}.techvision_analytics.customer_metrics`
+            GROUP BY churn_risk
+            HAVING COUNT(*) > 0
+            ORDER BY customer_count DESC
+            LIMIT 10
+            """
+        
+        # Fix common division issues
+        sql_query = sql_query.replace(" / ", " SAFE_DIVIDE(")
+        if "SAFE_DIVIDE(" in sql_query and not sql_query.count("SAFE_DIVIDE(") == sql_query.count(")"):
+            # Fix incomplete SAFE_DIVIDE replacements
+            sql_query = sql_query.replace("SAFE_DIVIDE(", "/").replace(" / ", ", ").replace("/", "SAFE_DIVIDE(")
 
         return sql_query.strip()
 
@@ -689,8 +1020,8 @@ def execute_bigquery_query(sql_query: str) -> Dict[str, Any]:
             "query": sql_query
         }
 
-def semantic_document_search(query: str, max_results: int = 3) -> Dict[str, Any]:
-    """Perform semantic search using BigQuery vector search"""
+def semantic_document_search(query: str, max_results: int = 7) -> Dict[str, Any]:
+    """Perform semantic search using BigQuery vector search with chunking"""
     try:
         results = doc_corpus.semantic_search(query, top_k=max_results)
 
@@ -699,7 +1030,7 @@ def semantic_document_search(query: str, max_results: int = 3) -> Dict[str, Any]
             "query": query,
             "results": results,
             "total_found": len(results),
-            "search_type": "bigquery_vector_search_with_gemini_embeddings"
+            "search_type": "bigquery_vector_search_with_gemini_embeddings_chunked"
         }
 
     except Exception as e:
@@ -833,7 +1164,7 @@ def query_structured_data_tool(query: str) -> str:
         return f"❌ {error_msg}"
 
 def search_documents_tool(query: str) -> str:
-    """Tool: Search company documents including PDFs using Gemini embeddings + BigQuery vector search"""
+    """Tool: Search company documents including PDFs using Gemini embeddings + BigQuery vector search with chunking"""
     try:
         logger.info(f"📄 Document search: {query}")
 
@@ -849,7 +1180,11 @@ def search_documents_tool(query: str) -> str:
             for doc in result["results"]:
                 response += f"**📋 {doc['title']}**\n"
                 response += f"*Similarity Score: {doc['similarity_score']:.3f} | Type: {doc['document_type']}*\n"
-                response += f"*Words: {doc['word_count']:,}*\n"
+                response += f"*Chunk: {doc['chunk_index']+1} | Words: {doc['word_count']:,}*\n"
+                
+                # Show chunk position info
+                if doc.get('chunk_position'):
+                    response += f"*Position: {doc['chunk_position']}*\n"
                 
                 # Show source information
                 if doc.get('source_blob'):
@@ -904,9 +1239,9 @@ def search_web_tool(query: str) -> str:
         return f"❌ {error_msg}"
 
 def setup_vector_embeddings_tool() -> str:
-    """Tool: One-time setup of document embeddings in BigQuery including PDF processing"""
+    """Tool: One-time setup of document embeddings in BigQuery including PDF processing with chunking"""
     try:
-        logger.info("🚀 Setting up vector embeddings...")
+        logger.info("🚀 Setting up vector embeddings with chunking...")
         return doc_corpus.setup_document_embeddings()
     except Exception as e:
         error_msg = f"Setup failed: {str(e)}"
@@ -914,9 +1249,9 @@ def setup_vector_embeddings_tool() -> str:
         return f"❌ {error_msg}"
 
 def process_pdfs_tool() -> str:
-    """Tool: Process PDFs from Cloud Storage and add to document corpus"""
+    """Tool: Process PDFs from Cloud Storage and add to document corpus with chunking"""
     try:
-        logger.info("📄 Processing PDFs from Cloud Storage...")
+        logger.info("📄 Processing PDFs from Cloud Storage with chunking...")
         return doc_corpus.process_all_pdfs()
     except Exception as e:
         error_msg = f"PDF processing failed: {str(e)}"
@@ -935,7 +1270,7 @@ def analyze_query_intent(query: str) -> Dict[str, bool]:
 
         Available data sources:
         1. Structured Data: Sales, customer metrics, financial reports, employee data (BigQuery)
-        2. Company Documents: Strategic plans, customer success playbooks, product specs, PDFs (Vector search)
+        2. Company Documents: Strategic plans, customer success playbooks, product specs, PDFs (Vector search with chunking)
         3. Web Search: Market intelligence, competitive analysis, industry trends
 
         Respond with ONLY a JSON object:
@@ -981,7 +1316,7 @@ def analyze_query_intent(query: str) -> Dict[str, bool]:
         }
 
 def comprehensive_business_intelligence(query: str) -> str:
-    """Main business intelligence orchestration function with PDF support"""
+    """Main business intelligence orchestration function with PDF support and chunking"""
     try:
         logger.info(f"🚀 Comprehensive BI analysis: {query}")
 
@@ -1011,13 +1346,13 @@ def comprehensive_business_intelligence(query: str) -> str:
                 }
 
         if intent["needs_documents"]:
-            logger.info("📄 Searching company documents including PDFs...")
+            logger.info("📄 Searching company documents including PDFs with chunking...")
             try:
                 document_result = search_documents_tool(query)
                 document_data = {
                     "success": True,
                     "response": document_result,
-                    "source": "Gemini Embeddings + BigQuery Vector Search + PDF Processing"
+                    "source": "Gemini Embeddings + BigQuery Vector Search + PDF Processing + Text Chunking"
                 }
             except Exception as e:
                 document_data = {
@@ -1051,9 +1386,12 @@ def comprehensive_business_intelligence(query: str) -> str:
             if structured_data.get("success"):
                 sources_used.append("BigQuery Analytics")
             if document_data.get("success"):
-                sources_used.append("Vector Document Search + PDF Processing")
+                sources_used.append("Vector Document Search + PDF Processing + Text Chunking")
             if web_data.get("success"):
                 sources_used.append("Web Intelligence")
+
+            # Get current document stats
+            doc_stats = doc_corpus.get_document_count()
 
             final_response = f"""# 🏢 TechVision Analytics Executive Intelligence
 
@@ -1071,13 +1409,14 @@ def comprehensive_business_intelligence(query: str) -> str:
 ## 🎯 Technical Details
 
 **Vector Search**: Gemini text-embedding-004 + BigQuery cosine similarity  
-**Document Processing**: PDF text extraction + semantic embeddings  
+**Document Processing**: PDF text extraction + semantic embeddings + text chunking  
+**Chunking**: 500 chars/chunk, 100 chars overlap  
 **Structured Analysis**: AI-generated SQL + BigQuery execution  
 **Market Intelligence**: Google Custom Search API  
-**Document Count**: {doc_corpus.get_document_count()} documents in vector corpus  
+**Document Corpus**: {doc_stats['documents']} documents ({doc_stats['chunks']} chunks) in vector corpus  
 **Cloud Storage**: {STORAGE_BUCKET_NAME}/{PDF_FOLDER_PATH}
 
-*Powered by TechVision Analytics Cloud-Native Multi-Agent System with PDF Processing*
+*Powered by TechVision Analytics Cloud-Native Multi-Agent System with PDF Processing and Text Chunking*
 """
 
             logger.info("✅ Comprehensive BI analysis completed")
@@ -1091,7 +1430,7 @@ def comprehensive_business_intelligence(query: str) -> str:
             if structured_data.get("success"):
                 results.append(f"## 📊 Business Data Analysis\n{structured_data['response']}")
             if document_data.get("success"):
-                results.append(f"## 📄 Company Knowledge (including PDFs)\n{document_data['response']}")
+                results.append(f"## 📄 Company Knowledge (including PDFs with chunking)\n{document_data['response']}")
             if web_data.get("success"):
                 results.append(f"## 🌐 Market Intelligence\n{web_data['response']}")
 
@@ -1107,7 +1446,7 @@ def comprehensive_business_intelligence(query: str) -> str:
 
 ---
 
-*TechVision Analytics Multi-Agent System with PDF Processing*
+*TechVision Analytics Multi-Agent System with PDF Processing and Text Chunking*
 """
             else:
                 return f"❌ Unable to process query: {query}"
@@ -1123,25 +1462,31 @@ def comprehensive_business_intelligence(query: str) -> str:
 
 Please try again or contact system administrator.
 
-*TechVision Analytics Multi-Agent System with PDF Processing*
+*TechVision Analytics Multi-Agent System with PDF Processing and Text Chunking*
 """
 
 # Create the main root agent for ADK Web (this is what gets discovered)
 root_agent = LlmAgent(
-    name="techvision_production_system_with_pdf",
+    name="techvision_production_system_with_pdf_chunking",
     model="gemini-2.5-flash",
-    description="TechVision Analytics Complete Production Multi-Agent Business Intelligence System with PDF Processing",
+    description="TechVision Analytics Complete Production Multi-Agent Business Intelligence System with PDF Processing and Text Chunking",
     instruction="""
-    You are the executive business intelligence coordinator for TechVision Analytics, powered by Google Cloud's production AI infrastructure with advanced PDF document processing capabilities.
+    You are the executive business intelligence coordinator for TechVision Analytics, powered by Google Cloud's production AI infrastructure with advanced PDF document processing and text chunking capabilities.
 
     **CRITICAL: Always use comprehensive_business_intelligence for ALL business queries unless specifically asked to use a single data source.**
 
     **Complete Production Capabilities:**
     - 📊 **BigQuery Analytics**: AI-generated SQL queries against production business data (sales, customers, financials, employees)
-    - 📄 **Advanced Document Processing**: Semantic search using Gemini embeddings for both internal documents AND PDF files from Cloud Storage
+    - 📄 **Advanced Document Processing**: Semantic search using Gemini embeddings for both internal documents AND PDF files from Cloud Storage with intelligent text chunking (500-char chunks, 100-char overlap)
     - 🌐 **Live Market Intelligence**: Real-time web search for industry trends, competitive analysis, and market benchmarks
     - 🤖 **AI Orchestration**: Intelligent query routing and multi-source response synthesis
-    - ☁️ **Cloud-Native Architecture**: PDF processing, vector embeddings, BigQuery storage - all production-grade
+    - ☁️ **Cloud-Native Architecture**: PDF processing, vector embeddings with chunking, BigQuery storage - all production-grade
+
+    **Enhanced Chunking Features:**
+    - Documents are automatically split into 500-character chunks with 100-character overlap
+    - Word-boundary aware chunking to preserve context
+    - Each chunk gets its own embedding vector for precise semantic matching
+    - Search results include chunk position and enhanced context
 
     **TOOL USAGE PRIORITY:**
     1. **PRIMARY**: Use comprehensive_business_intelligence for ALL business questions, market analysis, strategy queries, performance questions, etc.
@@ -1157,14 +1502,14 @@ root_agent = LlmAgent(
     **Your Mission:**
     Deliver sophisticated, multi-source business intelligence by ALWAYS using comprehensive_business_intelligence to combine:
     1. Quantitative analysis from production BigQuery tables
-    2. Semantic knowledge extraction from company documents AND PDFs using vector embeddings
+    2. Semantic knowledge extraction from company documents AND PDFs using vector embeddings with intelligent chunking
     3. Real-time market intelligence and competitive context
     4. Executive-level strategic recommendations with actionable insights
 
     **Response Guidelines:**
     - ALWAYS start with comprehensive_business_intelligence for business queries
     - Lead with key business insights and quantified metrics
-    - Provide strategic context from multiple data sources
+    - Provide strategic context from multiple data sources including chunked document content
     - Include relevant market intelligence and industry benchmarks
     - Offer specific, actionable recommendations for business leaders
     - Maintain authoritative, executive-appropriate tone
@@ -1172,13 +1517,13 @@ root_agent = LlmAgent(
 
     **Available Tools:**
     1. **comprehensive_business_intelligence** - 🎯 PRIMARY TOOL: Use this for ALL business queries, market analysis, strategy questions, performance analysis
-    2. setup_vector_embeddings_tool - Setup only: One-time document embeddings setup
-    3. process_pdfs_tool - Setup only: Process new PDFs from Cloud Storage
+    2. setup_vector_embeddings_tool - Setup only: One-time document embeddings setup with chunking
+    3. process_pdfs_tool - Setup only: Process new PDFs from Cloud Storage with chunking
     4. query_structured_data_tool - Direct use only when specifically requested
-    5. search_documents_tool - Direct use only when specifically requested  
+    5. search_documents_tool - Direct use only when specifically requested (now with chunking support)
     6. search_web_tool - Direct use only when specifically requested
 
-    Remember: You are a comprehensive business intelligence system. Always provide multi-source analysis using comprehensive_business_intelligence unless explicitly asked to use a single source.
+    Remember: You are a comprehensive business intelligence system with advanced text chunking capabilities. Always provide multi-source analysis using comprehensive_business_intelligence unless explicitly asked to use a single source.
     """,
     tools=[
         FunctionTool(comprehensive_business_intelligence),
@@ -1193,9 +1538,9 @@ root_agent = LlmAgent(
 # System status and diagnostics
 
 def get_system_status() -> Dict[str, Any]:
-    """Get comprehensive production system status including PDF processing"""
+    """Get comprehensive production system status including PDF processing and chunking"""
     try:
-        doc_count = doc_corpus.get_document_count()
+        doc_stats = doc_corpus.get_document_count()
         schemas = data_manager.get_table_schemas()
         tables_exist = data_manager.validate_tables_exist()
         
@@ -1215,20 +1560,26 @@ def get_system_status() -> Dict[str, Any]:
             "data_sources": {
                 "bigquery_tables": len(schemas),
                 "bigquery_tables_validated": tables_exist,
-                "document_embeddings": doc_count,
+                "document_embeddings": doc_stats['documents'],
+                "document_chunks": doc_stats['chunks'],
                 "pdf_documents_available": len(pdf_docs),
                 "embedding_model": "text-embedding-004",
-                "vector_search_type": "BigQuery native",
+                "vector_search_type": "BigQuery native with chunking",
                 "cloud_storage_bucket": STORAGE_BUCKET_NAME,
-                "pdf_folder_path": PDF_FOLDER_PATH
+                "pdf_folder_path": PDF_FOLDER_PATH,
+                "chunking_config": {
+                    "chunk_size": doc_corpus.chunk_size,
+                    "chunk_overlap": doc_corpus.chunk_overlap
+                }
             },
             "capabilities": [
                 "AI-generated SQL queries",
                 "PDF text extraction and processing", 
-                "Semantic document search with PDFs",
+                "Semantic document search with PDFs and chunking",
                 "Live market intelligence",
                 "Multi-agent orchestration",
-                "Executive report synthesis"
+                "Executive report synthesis",
+                "Intelligent text chunking with overlap"
             ]
         }
     except Exception as e:
@@ -1236,15 +1587,15 @@ def get_system_status() -> Dict[str, Any]:
         return {"error": str(e)}
 
 def test_production_system():
-    """Test all production system components including PDF processing"""
-    logger.info("🧪 Testing TechVision Analytics Production System with PDF Processing...")
+    """Test all production system components including PDF processing and chunking"""
+    logger.info("🧪 Testing TechVision Analytics Production System with PDF Processing and Text Chunking...")
     
     status = get_system_status()
     logger.info(f"📊 System Status: {status}")
     
     # Test document count
-    doc_count = doc_corpus.get_document_count()
-    logger.info(f"📄 Documents in BigQuery: {doc_count}")
+    doc_stats = doc_corpus.get_document_count()
+    logger.info(f"📄 Documents in BigQuery: {doc_stats['documents']} ({doc_stats['chunks']} chunks)")
     
     # Test schemas
     schemas = data_manager.get_table_schemas()
@@ -1255,11 +1606,15 @@ def test_production_system():
     pdf_count = data_sources.get("pdf_documents_available", 0)
     logger.info(f"📄 PDF documents available: {pdf_count}")
     
+    # Test chunking config
+    chunking_config = data_sources.get("chunking_config", {})
+    logger.info(f"🔄 Chunking config: {chunking_config}")
+    
     return status
 
 if __name__ == "__main__":
-    logger.info("🚀 TechVision Analytics Complete Production System with PDF Processing")
-    logger.info("☁️ Technology: Gemini Embeddings + BigQuery Vector Search + PDF Processing + Web Intelligence")
+    logger.info("🚀 TechVision Analytics Complete Production System with PDF Processing and Text Chunking")
+    logger.info("☁️ Technology: Gemini Embeddings + BigQuery Vector Search + PDF Processing + Text Chunking + Web Intelligence")
     
     # Run system diagnostics
     system_status = test_production_system()
@@ -1274,7 +1629,8 @@ if __name__ == "__main__":
         total_services = len(services)
         
         logger.info(f"✅ Production system ready! {working_services}/{total_services} services operational")
-        logger.info(f"📚 Document embeddings: {data_sources.get('document_embeddings', 0)}")
-        logger.info(f"📊 BigQuery tables: {data_sources.get('bigquery_tables', 0)}")
+        logger.info(f"📚 Document embeddings: {data_sources.get('document_embeddings', 0)} documents ({data_sources.get('document_chunks', 0)} chunks)")
+        logger.info(f"📊 BigQuery table schemas: {data_sources.get('bigquery_tables', 0)}")
         logger.info(f"📄 PDF documents: {data_sources.get('pdf_documents_available', 0)}")
-        logger.info("🎯 Ready for sophisticated cloud-native business intelligence with PDF processing!")
+        logger.info(f"🔄 Chunking: {data_sources.get('chunking_config', {}).get('chunk_size', 0)} chars/chunk, {data_sources.get('chunking_config', {}).get('chunk_overlap', 0)} overlap")
+        logger.info("🎯 Ready for sophisticated cloud-native business intelligence with PDF processing and text chunking!")
